@@ -9,6 +9,7 @@ from numpy import array, concatenate, dot, eye, log, outer, zeros, \
 from numpy.random import rand, randn
 from numpy.linalg import cholesky, det, inv
 from scipy import optimize
+from scipy.stats import multivariate_normal as mvn
 
 from minimize import minimize
 
@@ -65,32 +66,45 @@ class NceGauss(object):
     def _init_params(self, D, mu0=None, P0=None, c0=None):
         assert(isinstance(D, np.int))
         self._D = D
-        mu = randn(D) if mu0 is None else mu0
+        mu = zeros(D) if mu0 is None else mu0
         P = eye(D) if P0 is None else P0
         c = 1. if c0 is None else c0
         L = cholesky(P)
         assert(D == mu.size)
         assert(D == P.shape[0] == P.shape[1])
         assert(isinstance(c, np.float) or c.size == 1)
-        self._params = GaussParams(mu, L, c)
+        self._params_nce = GaussParams(mu, L, c)
 
     @property
-    def params(self):
-        assert(hasattr(self, '_params'))
-        return self._params
+    def params_nce(self):
+        assert(hasattr(self, '_params_nce'))
+        return self._params_nce
+
+    @property
+    def params_noise(self):
+        assert(hasattr(self, '_params_noise'))
+        return self._params_noise
 
     @property
     def params_ml(self):
         assert(hasattr(self, '_params_ml'))
         return self._params_ml
 
-    def fit(self, X, Y, mu0=None, P0=None, c0=None,
-            maxnumlinesearch=None, maxnumfuneval=None, verbose=False):
-        assert(X.shape[0] == Y.shape[0])
+
+    def fit_nce(self, X, k=1, mu_noise=None, P_noise=None,
+                mu0=None, P0=None, c0=None,
+                maxnumlinesearch=None, maxnumfuneval=None, verbose=False):
         _class = self.__class__
-        D = X.shape[0] or self._D
+
+        D, Td = X.shape
+        mu_noise =  zeros(D) if mu_noise is None else mu_noise
+        P_noise =  eye(D) if P_noise is None else P_noise
+        assert(D == mu_noise.size)
+        assert(D == P_noise.shape[0] == P_noise.shape[1])
+        Y = mvn.rvs(mu_noise, P_noise, k * Td).T
+
         self._init_params(D, mu0, P0, c0)
-        t0 = params_to_vec(*self._params)
+        t0 = params_to_vec(*self._params_nce)
 
         maxnumlinesearch = maxnumlinesearch or DEFAULT_MAXNUMLINESEARCH
         obj = lambda u: _class.J(X, Y, *vec_to_params(u))
@@ -99,12 +113,12 @@ class NceGauss(object):
         # t_star = minimize(t0, obj, grad, maxnumlinesearch=maxnumlinesearch,
         #                   maxnumfuneval=maxnumfuneval, verbose=verbose)
         t_star = sp_minimize(obj, t0, method='BFGS', jac=grad,
-                             options={'disp': True,
+                             options={'disp': verbose,
                                       'maxiter': maxnumlinesearch})
-        t_star = (t_star.x.flatten(), array([1]))
+        t_star = (t_star.x, array([1]))
 
-        self._params = GaussParams(*vec_to_params(t_star[0]))
-        return (self._params, t_star[1])
+        self._params_nce = GaussParams(*vec_to_params(t_star[0]))
+        return (self._params_nce, Y)
 
     def fit_ml(self, X):
         D = X.shape[0]
@@ -112,12 +126,6 @@ class NceGauss(object):
         P = inv(cov(X))
         c = log(det(P)) / 2. - D * log(2 * pi) / 2.
         self._params_ml = GaussParams(mu, P, c)
-
-    @staticmethod
-    def _h(u, D, k, mu, P, c):
-        log_pn = -D * log(2. * pi) / 2. - dot(u, u) / 2.
-        log_pm = -dot(dot(u - mu, P), u - mu) / 2. + c
-        return log_pm - log_pn - log(k)
 
     @staticmethod
     def _hv(U, Uzero, D, k, mu, P, c):
@@ -156,21 +164,16 @@ class NceGauss(object):
 
         Xzero, Yzero = X - mu.reshape(D, 1), Y - mu.reshape(D, 1)
         hvv = lambda U, Uzero: NceGauss._hv(U, Uzero, D, k, mu, P, c)
+        rhX, rhY = r(-hvv(X, Xzero)), r(hvv(Y, Yzero))
 
-        dmu = np.sum(r(-hvv(X, Xzero)) * dot(P, Xzero), 1)
-        dmu -= np.sum(r(hvv(Y, Yzero)) * dot(P, Yzero), 1)
+        dmu = np.sum(rhX * dot(P, Xzero), 1) - np.sum(rhY * dot(P, Yzero), 1)
         dmu /= Td
 
-        hm = lambda u: NceGauss._h(u, D, k, mu, P, c)
-        dL = -np.sum((r(-hm(X[:, t])) * dot(outer(Xzero[:, t], Xzero[:, t]), L)
-                      for t in xrange(Td)), 0)
-        dL += np.sum((r(hm(Y[:, t])) * dot(outer(Yzero[:, t], Yzero[:, t]), L)
-                      for t in xrange(Tn)), 0)
+        dL = -np.einsum('k,ik,jk->ij', rhX, Xzero, L.T.dot(Xzero))
+        dL += np.einsum('k,ik,jk->ij', rhY, Yzero, L.T.dot(Yzero))
         dL /= Td
 
-        dc = np.sum(r(-hvv(X, Xzero)))
-        dc -= np.sum(r(hvv(Y, Yzero)))
-        dc /= Td
+        dc = (np.sum(rhX) - np.sum(rhY)) / Td
         return (-dmu, -dL, -array([dc]))
 
 
@@ -197,13 +200,11 @@ class NceGaussTests(unittest.TestCase):
         mu = r_[0., 0.]
         S = c_[[2., .2], [.2, 2.]]
         P = np.linalg.inv(S)
-        Td = 10
-        k = 1
+        Td, k = 100, 2
         X = mvn.rvs(mu, S, Td).T
-        Y = mvn.rvs(r_[0, 0], 1*S, k * Td).T
         theta = GaussParams(zeros(2), eye(2), 1.)
-        theta_star = self.model.fit(
-            X, Y, *theta, maxnumlinesearch=1000, verbose=False)[0]
+        theta_star, Y = self.model.fit_nce(
+            X, k, mu0=mu, P0=P, maxnumlinesearch=2000, verbose=True)
         self.assertLess(
             NceGauss.J(X, Y, *theta_star), NceGauss.J(X, Y, *theta))
         self.assertLess(
