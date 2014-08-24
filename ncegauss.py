@@ -21,14 +21,17 @@ DEFAULT_MAXNUMLINESEARCH = 150
 sigmoid = lambda u: 1.0 / (1.0 + np.exp(-u))
 GaussParams = namedtuple('GaussParams', ['mu', 'L', 'c'])
 
+def gauss_logZ(L):
+    assert(L.shape[0] == L.shape[1])
+    assert(all(np.tril(L_noise) == L_noise))
+    return -log(det(L)) + D * log(2 * pi) / 2.
 
 def loglik(X, mu, L):
     D, N = X.shape
-    Xzero = X - mu.reshape(D, 1)
-    P = L.dot(L.T)
-    L = -D * N * log(2 * pi) / 2. + N * log(det(P)) / 2.
-    L -= np.einsum('ij,ji->', Xzero.T.dot(P), Xzero) / 2.
-    return -L
+    LtXzero = L.T.dot(X - mu.reshape(D, 1))
+    l = N * log(det(L)) - D * N * log(2 * pi) / 2.
+    l -= np.einsum('ij,ji->', LtXzero.T, LtXzero) / 2.
+    return -l
 
 
 def loglik_vec(X, theta):
@@ -60,18 +63,23 @@ def vec_to_params(theta):
 
 
 class NceGauss(object):
-    def __init__(self):
-        self._D = None
-
-    def _init_params(self, D, mu0=None, P0=None, c0=None):
+    def _init_params(self, D, mu_noise=None, L_noise=None,
+                     mu=None, L=None, c=None):
         assert(isinstance(D, np.int))
-        self._D = D
-        mu = zeros(D) if mu0 is None else mu0
-        P = eye(D) if P0 is None else P0
-        c = 1. if c0 is None else c0
-        L = cholesky(P)
+
+        mu_noise =  zeros(D) if mu_noise is None else mu_noise
+        L_noise =  eye(D) if L_noise is None else L_noise
+        assert((np.tril(L_noise) == L_noise).all())
+        assert(D == mu_noise.size)
+        assert(D == L_noise.shape[0] == L_noise.shape[1])
+        self._params_noise = GaussParams(mu_noise, L_noise, 1)
+
+        mu = zeros(D) if mu is None else mu
+        L = eye(D) if L is None else L
+        c = 1. if c is None else c
+        assert((np.tril(L) == L).all())
         assert(D == mu.size)
-        assert(D == P.shape[0] == P.shape[1])
+        assert(D == L.shape[0] == L.shape[1])
         assert(isinstance(c, np.float) or c.size == 1)
         self._params_nce = GaussParams(mu, L, c)
 
@@ -90,52 +98,53 @@ class NceGauss(object):
         assert(hasattr(self, '_params_ml'))
         return self._params_ml
 
-
-    def fit_nce(self, X, k=1, mu_noise=None, P_noise=None,
-                mu0=None, P0=None, c0=None,
+    def fit_nce(self, X, k=1, mu_noise=None, L_noise=None,
+                mu0=None, L0=None, c0=None, method='minimize',
                 maxnumlinesearch=None, maxnumfuneval=None, verbose=False):
         _class = self.__class__
-
         D, Td = X.shape
-        mu_noise =  zeros(D) if mu_noise is None else mu_noise
-        P_noise =  eye(D) if P_noise is None else P_noise
-        assert(D == mu_noise.size)
-        assert(D == P_noise.shape[0] == P_noise.shape[1])
-        Y = mvn.rvs(mu_noise, P_noise, k * Td).T
+        self._init_params(D, mu_noise, L_noise, mu0, L0, c0)
 
-        self._init_params(D, mu0, P0, c0)
-        t0 = params_to_vec(*self._params_nce)
+        noise = self._params_noise
+        Y = mvn.rvs(noise.mu, noise.L, k * Td).T
 
         maxnumlinesearch = maxnumlinesearch or DEFAULT_MAXNUMLINESEARCH
-        obj = lambda u: _class.J(X, Y, *vec_to_params(u))
-        grad = lambda u: params_to_vec(*_class.dJ(X, Y, *vec_to_params(u)))
+        obj = lambda u: _class.J(X, Y, noise.mu, noise.L, *vec_to_params(u))
+        grad = lambda u: params_to_vec(
+            *_class.dJ(X, Y, noise.mu, noise.L, *vec_to_params(u)))
 
-        # t_star = minimize(t0, obj, grad, maxnumlinesearch=maxnumlinesearch,
-        #                   maxnumfuneval=maxnumfuneval, verbose=verbose)
-        t_star = sp_minimize(obj, t0, method='BFGS', jac=grad,
-                             options={'disp': verbose,
-                                      'maxiter': maxnumlinesearch})
-        t_star = (t_star.x, array([1]))
-
-        self._params_nce = GaussParams(*vec_to_params(t_star[0]))
+        t0 = params_to_vec(*self._params_nce)
+        if method == 'minimize':
+            t_star = minimize(t0, obj, grad,
+                              maxnumlinesearch=maxnumlinesearch,
+                              maxnumfuneval=maxnumfuneval, verbose=verbose)[0]
+        else:
+            t_star = sp_minimize(obj, t0, method='BFGS', jac=grad,
+                                 options={'disp': verbose,
+                                          'maxiter': maxnumlinesearch}).x
+        self._params_nce = GaussParams(*vec_to_params(t_star))
         return (self._params_nce, Y)
 
     def fit_ml(self, X):
         D = X.shape[0]
         mu = mean(X, 1)
-        P = inv(cov(X))
-        c = log(det(P)) / 2. - D * log(2 * pi) / 2.
-        self._params_ml = GaussParams(mu, P, c)
+        L = cholesky(inv(cov(X)))
+        c = log(det(L)) - D * log(2 * pi) / 2.
+        self._params_ml = GaussParams(mu, L, c)
 
     @staticmethod
-    def _hv(U, Uzero, D, k, mu, P, c):
+    def _h(U, Uzero, D, k, mu_noise, L_noise, mu, L, c):
         assert(U.shape == Uzero.shape)
-        log_pn = -D * log(2. * pi) / 2. - np.einsum('ij,ji->i', U.T, U) / 2.
+        Uzero_noise = U - mu_noise.reshape(D, 1)
+        P, P_noise = L.dot(L.T), L_noise.dot(L_noise.T)
+        log_pn = log(det(L_noise)) - D * log(2. * pi) / 2.
+        log_pn -= np.einsum('ij,jk,ki->i',
+                            Uzero_noise.T, P_noise, Uzero_noise) / 2.
         log_pm = -np.einsum('ij,jk,ki->i', Uzero.T, P, Uzero) / 2. + c
         return log_pm - log_pn - log(k)
 
     @staticmethod
-    def J(X, Y, mu, L, c):
+    def J(X, Y, mu_noise, L_noise, mu, L, c):
         """NCE objective function with gaussian data likelihood X and
         gaussian noise Y."""
         assert(mu.size == X.shape[0] == Y.shape[0])
@@ -143,28 +152,37 @@ class NceGauss(object):
         D, Td = X.shape
         Tn = Y.shape[1]
         k = Tn / Td
-        P = dot(L, L.T)
 
         Xzero, Yzero = X - mu.reshape(D, 1), Y - mu.reshape(D, 1)
-        hvv = lambda U, Uzero: NceGauss._hv(U, Uzero, D, k, mu, P, c)
+        h = lambda U, Uzero: NceGauss._h(
+            U, Uzero, D, k, mu_noise, L_noise, mu, L, c)
+        Jm = -np.sum(log(1 + np.exp(-h(X, Xzero))))
+        Jn = -np.sum(log(1 + np.exp(h(Y, Yzero))))
 
-        Jm = -np.sum(log(1 + np.exp(-hvv(X, Xzero))))
-        Jn = -np.sum(log(1 + np.exp(hvv(Y, Yzero))))
+        print("Jm=%10.4f "
+              "max(-h(X, Xzero))=%12.3f " %
+              (Jm,  max(-h(X, Xzero))))
+        print("Jn=%10.4f "
+              "max(-h(Y, Yzero))=%12.3f " %
+              (Jn,  max(-h(Y, Yzero))))
+        print("mu=%s\n; L=%10.4f\n" % (mu, loglik(X, mu, L)))
+
         return -(Jm + Jn) / Td
 
     @staticmethod
-    def dJ(X, Y, mu, L, c):
+    def dJ(X, Y, mu_noise, L_noise, mu, L, c):
         """Gradient of the NCE objective function."""
         assert(mu.size == X.shape[0] == Y.shape[0])
         r = sigmoid
         D, Td = X.shape
         Tn = Y.shape[1]
         k = Tn / Td
-        P = dot(L, L.T)
+        P, P_noise = dot(L, L.T), dot(L_noise, L_noise.T)
 
         Xzero, Yzero = X - mu.reshape(D, 1), Y - mu.reshape(D, 1)
-        hvv = lambda U, Uzero: NceGauss._hv(U, Uzero, D, k, mu, P, c)
-        rhX, rhY = r(-hvv(X, Xzero)), r(hvv(Y, Yzero))
+        h = lambda U, Uzero: NceGauss._h(
+            U, Uzero, D, k, mu_noise, L_noise, mu, L, c)
+        rhX, rhY = r(-h(X, Xzero)), r(h(Y, Yzero))
 
         dmu = np.sum(rhX * dot(P, Xzero), 1) - np.sum(rhY * dot(P, Yzero), 1)
         dmu /= Td
@@ -185,11 +203,15 @@ class NceGaussTests(unittest.TestCase):
         D = 2
         S = c_[[2., .2], [.2, 2.]]
         X = mvn.rvs(randn(2), S, 100).T
-        Y = mvn.rvs(r_[0, 1], eye(2), 200).T
 
-        obj = lambda u: NceGauss.J(X, Y, *vec_to_params(u))
-        grad = lambda u: \
-               params_to_vec(*NceGauss.dJ(X, Y, *vec_to_params(u)))
+        mu_noise, P_noise = r_[-1., 1.], .5 * c_[[1., .1], [.1, 1.]]
+        L_noise = cholesky(P_noise)
+        Y = mvn.rvs(mu_noise, inv(P_noise), 200).T
+
+        obj = lambda u: NceGauss.J(
+            X, Y, mu_noise, L_noise, *vec_to_params(u))
+        grad = lambda u: params_to_vec(
+            *NceGauss.dJ(X, Y, mu_noise, L_noise, *vec_to_params(u)))
         grad_diff = lambda u: check_grad(obj, grad, u)
 
         for i in xrange(100):
@@ -197,18 +219,20 @@ class NceGaussTests(unittest.TestCase):
             self.assertLess(grad_diff(u), 1e-5)
 
     def test_sanity_fit(self):
-        mu = r_[0., 0.]
-        S = c_[[2., .2], [.2, 2.]]
-        P = np.linalg.inv(S)
+        mu, P = r_[0., 0.], c_[[2., .2], [.2, 2.]]
+        L = cholesky(P)
         Td, k = 100, 2
-        X = mvn.rvs(mu, S, Td).T
+        X = mvn.rvs(mu, inv(P), Td).T
         theta = GaussParams(zeros(2), eye(2), 1.)
+
         theta_star, Y = self.model.fit_nce(
-            X, k, mu0=mu, P0=P, maxnumlinesearch=2000, verbose=True)
-        self.assertLess(
-            NceGauss.J(X, Y, *theta_star), NceGauss.J(X, Y, *theta))
-        self.assertLess(
-            np.sum(params_to_vec(*NceGauss.dJ(X, Y, *theta_star)) ** 2), 1e-6)
+            X, k, mu_noise=randn(2), L_noise=(rand() + 1) * eye(2),
+            mu0=mu, L0=L, maxnumlinesearch=2000, verbose=False)
+        noise = self.model.params_noise
+        self.assertLess(NceGauss.J(X, Y, noise.mu, noise.L, *theta_star),
+                        NceGauss.J(X, Y, noise.mu, noise.L, *theta))
+        self.assertLess(np.sum(params_to_vec(
+            *NceGauss.dJ(X, Y, noise.mu, noise.L, *theta_star)) ** 2), 1e-6)
 
 
 if __name__ == '__main__':
